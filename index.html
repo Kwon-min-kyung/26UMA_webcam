@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hand Landmark - MediaPipe</title>
+  <style>
+    @font-face {
+      font-family: 'UnShinmun';
+      src: url('UnShinmun.ttf') format('truetype');
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'UnShinmun', sans-serif; }
+    body {
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'UnShinmun', sans-serif;
+      color: #eee;
+      overflow: hidden;
+    }
+    video { display: none; }
+    canvas {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: transparent;
+    }
+    #drawCanvas {
+      display: none;
+      transform: scaleX(-1);
+      z-index: 1;
+    }
+    #drawCanvas.active { display: block; }
+    #landmarkCanvas {
+      display: none;
+      transform: scaleX(-1);
+      z-index: 2;
+      pointer-events: none;
+    }
+    #landmarkCanvas.active { display: block; }
+    #startBtn {
+      padding: 14px 40px;
+      font-size: 1rem;
+      font-weight: 500;
+      color: #00ffff;
+      background: transparent;
+      border: 1.5px solid #00ffff;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.2s, color 0.2s;
+      letter-spacing: 0.5px;
+      z-index: 10;
+      position: relative;
+    }
+    #startBtn:hover {
+      background: #00ffff;
+      color: #000;
+    }
+    #startBtn.hidden { display: none; }
+    #status {
+      margin-top: 16px;
+      font-size: 0.9rem;
+      color: #aaa;
+      z-index: 10;
+      position: relative;
+    }
+    #status.hidden { display: none; }
+    #gesture {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      font-size: 0.85rem;
+      color: #aaa;
+      z-index: 10;
+      background: rgba(0,0,0,0.5);
+      padding: 8px 16px;
+      border-radius: 8px;
+      display: none;
+    }
+    #gesture.active { display: block; }
+  </style>
+</head>
+<body>
+  <video id="webcam" autoplay playsinline></video>
+  <canvas id="drawCanvas"></canvas>
+  <canvas id="landmarkCanvas"></canvas>
+  <p id="status"></p>
+  <div id="gesture"></div>
+
+  <!-- MediaPipe CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js"></script>
+
+  <script>
+    const videoEl = document.getElementById('webcam');
+    const drawCanvas = document.getElementById('drawCanvas');
+    const lmCanvas = document.getElementById('landmarkCanvas');
+    const drawCtx = drawCanvas.getContext('2d');
+    const lmCtx = lmCanvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const gestureEl = document.getElementById('gesture');
+
+    // 드로잉 상태
+    let isDrawing = false;
+    let lastPoint = null;
+
+    // 손가락 연결선 정의
+    const HAND_CONNECTIONS = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [0,9],[9,10],[10,11],[11,12],
+      [0,13],[13,14],[14,15],[15,16],
+      [0,17],[17,18],[18,19],[19,20],
+      [5,9],[9,13],[13,17]
+    ];
+
+    // 손가락이 펴져 있는지 판별
+    function isFingerExtended(landmarks, finger) {
+      // finger: 'index'=1, 'middle'=2, 'ring'=3, 'pinky'=4
+      const tips = [8, 12, 16, 20];
+      const pips = [6, 10, 14, 18];
+      const tip = landmarks[tips[finger]];
+      const pip = landmarks[pips[finger]];
+      return tip.y < pip.y; // y가 작을수록 위쪽
+    }
+
+    // 엄지 펴짐 판별
+    function isThumbExtended(landmarks) {
+      const tip = landmarks[4];
+      const ip = landmarks[3];
+      // 엄지는 x축으로 판별 (왼손/오른손 상관없이 거리로)
+      return Math.abs(tip.x - landmarks[0].x) > Math.abs(ip.x - landmarks[0].x);
+    }
+
+    // 제스처 판별
+    function detectGesture(landmarks) {
+      const indexUp = isFingerExtended(landmarks, 0);
+      const middleUp = isFingerExtended(landmarks, 1);
+      const ringUp = isFingerExtended(landmarks, 2);
+      const pinkyUp = isFingerExtended(landmarks, 3);
+
+      // Pointing Up: 검지만 펴고 나머지 접음
+      if (indexUp && !middleUp && !ringUp && !pinkyUp) {
+        return 'pointing';
+      }
+
+      // 주먹: 모든 손가락 접음
+      if (!indexUp && !middleUp && !ringUp && !pinkyUp) {
+        return 'fist';
+      }
+
+      return 'other';
+    }
+
+    // MediaPipe Hands 초기화
+    const hands = new Hands({
+      locateFile: (file) =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.5
+    });
+
+    hands.onResults((results) => {
+      // 랜드마크 캔버스는 매 프레임 클리어
+      lmCtx.clearRect(0, 0, lmCanvas.width, lmCanvas.height);
+
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks = results.multiHandLandmarks[0];
+        const gesture = detectGesture(landmarks);
+
+        // 제스처 표시
+        if (gesture === 'pointing') {
+          gestureEl.textContent = 'Pointing — 그리는 중';
+          gestureEl.style.color = '#ff6b6b';
+        } else if (gesture === 'fist') {
+          gestureEl.textContent = 'Fist — 멈춤';
+          gestureEl.style.color = '#aaa';
+        } else {
+          gestureEl.textContent = '대기';
+          gestureEl.style.color = '#aaa';
+        }
+
+        // 드로잉 로직
+        if (gesture === 'pointing') {
+          const tipX = landmarks[8].x * drawCanvas.width;
+          const tipY = landmarks[8].y * drawCanvas.height;
+
+          if (isDrawing && lastPoint) {
+            drawCtx.beginPath();
+            drawCtx.moveTo(lastPoint.x, lastPoint.y);
+            drawCtx.lineTo(tipX, tipY);
+            drawCtx.strokeStyle = '#00ffff';
+            drawCtx.lineWidth = 20;
+            drawCtx.lineCap = 'round';
+            drawCtx.lineJoin = 'round';
+            drawCtx.shadowColor = '#00ffff';
+            drawCtx.shadowBlur = 15;
+            drawCtx.stroke();
+            drawCtx.shadowBlur = 0;
+          }
+
+          isDrawing = true;
+          lastPoint = { x: tipX, y: tipY };
+        } else if (gesture === 'fist') {
+          isDrawing = false;
+          lastPoint = null;
+          drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+        } else {
+          // 다른 제스처면 선 끊기 (새 획 시작 가능)
+          isDrawing = false;
+          lastPoint = null;
+        }
+
+        // 랜드마크 그리기 (위에 겹쳐서)
+        lmCtx.strokeStyle = '#00d2ff';
+        lmCtx.lineWidth = 2;
+        for (const [start, end] of HAND_CONNECTIONS) {
+          const s = landmarks[start];
+          const e = landmarks[end];
+          lmCtx.beginPath();
+          lmCtx.moveTo(s.x * lmCanvas.width, s.y * lmCanvas.height);
+          lmCtx.lineTo(e.x * lmCanvas.width, e.y * lmCanvas.height);
+          lmCtx.stroke();
+        }
+
+        for (const lm of landmarks) {
+          const x = lm.x * lmCanvas.width;
+          const y = lm.y * lmCanvas.height;
+          lmCtx.beginPath();
+          lmCtx.arc(x, y, 4, 0, 2 * Math.PI);
+          lmCtx.fillStyle = '#ff6b6b';
+          lmCtx.fill();
+          lmCtx.strokeStyle = '#fff';
+          lmCtx.lineWidth = 1.5;
+          lmCtx.stroke();
+        }
+
+        statusEl.textContent = '손 감지됨';
+      } else {
+        statusEl.textContent = '손을 카메라에 보여주세요';
+        isDrawing = false;
+        lastPoint = null;
+      }
+    });
+
+    // 캔버스 크기를 화면에 맞춤
+    function resizeCanvas() {
+      // 드로잉 캔버스 내용 보존
+      const tempImg = new Image();
+      tempImg.src = drawCanvas.toDataURL();
+      const oldW = drawCanvas.width;
+      const oldH = drawCanvas.height;
+
+      drawCanvas.width = window.innerWidth;
+      drawCanvas.height = window.innerHeight;
+      lmCanvas.width = window.innerWidth;
+      lmCanvas.height = window.innerHeight;
+
+      // 이전 드로잉 복원
+      if (oldW && oldH) {
+        tempImg.onload = () => {
+          drawCtx.drawImage(tempImg, 0, 0, oldW, oldH, 0, 0, drawCanvas.width, drawCanvas.height);
+        };
+      }
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    // 페이지 로드 시 자동 시작
+    resizeCanvas();
+    drawCanvas.classList.add('active');
+    lmCanvas.classList.add('active');
+    gestureEl.classList.add('active');
+    statusEl.textContent = '모델 로딩 중...';
+
+    const camera = new Camera(videoEl, {
+      onFrame: async () => {
+        await hands.send({ image: videoEl });
+      },
+      width: 640,
+      height: 480
+    });
+
+    camera.start().then(() => {
+      statusEl.textContent = '손을 카메라에 보여주세요';
+    });
+  </script>
+</body>
+</html>
